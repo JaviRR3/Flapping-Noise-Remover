@@ -45,6 +45,23 @@ def write_wav(path, fs, x):
     wavfile.write(path, fs, (np.clip(x, -1, 1) * 32767).astype(np.int16))
 
 
+def save_figure(fig, path):
+    """Guarda PNG; si el archivo previo está bloqueado, conserva ambos con sufijo."""
+    try:
+        fig.savefig(path, dpi=120)
+        return path
+    except OSError:
+        root, ext = os.path.splitext(path)
+        n = 1
+        while True:
+            alt = f"{root}_{n}{ext}"
+            if not os.path.exists(alt):
+                fig.savefig(alt, dpi=120)
+                print(f"No se pudo sobrescribir {path}; figura guardada como {alt}")
+                return alt
+            n += 1
+
+
 # ------------------------------------------------------------------ RPM
 class Rpm:
     """RPM en rejilla de 100 Hz: cruda (para la puerta) y media movil (para el aleteo)."""
@@ -142,54 +159,148 @@ def cycle_marks(xs, fs, fout_guide):
     return np.round(best * dec).astype(int)
 
 
-def sync_cancel(x, fs, rpm, ta, tb, K=15, shrink=2.0, depth=1.0):
+def phase_spectral_suppress(x, fs, marks, strength=2.0, min_gain=0.12):
+    """Atenua bins cuya energía aumenta de forma repetida en la misma fase del ciclo."""
+    nper, hop = 1024, 256
+    f, tt, Z = signal.stft(x, fs, nperseg=nper, noverlap=nper-hop,
+                           boundary="zeros", padded=True)
+    mag = np.abs(Z)
+    cyc = np.searchsorted(marks, tt * fs, side="right") - 1
+    valid = (cyc >= 0) & (cyc < len(marks)-1)
+    phase = np.zeros(len(tt), dtype=int)
+    if np.any(valid):
+        frac = (tt[valid] * fs - marks[cyc[valid]]) / np.maximum(
+            marks[cyc[valid]+1] - marks[cyc[valid]], 1)
+        nphase = 32
+        phase[valid] = np.clip((frac * nphase).astype(int), 0, nphase-1)
+    else:
+        return x.copy(), 1.0
+
+    nphase = 32
+    profile = np.ones((len(f), nphase), dtype=np.float64)
+    for p in range(nphase):
+        cols = np.flatnonzero(valid & (phase == p))
+        if len(cols):
+            profile[:, p] = np.median(mag[:, cols], axis=1)
+    profile = ndimage.gaussian_filter1d(profile, 1.0, axis=1, mode="wrap")
+    profile = ndimage.gaussian_filter1d(profile, 1.25, axis=0, mode="nearest")
+    base = np.median(profile, axis=1, keepdims=True)
+    gain = np.clip((base / np.maximum(profile, 1e-12)) ** strength, min_gain, 1.0)
+    gain[(f < 250) | (f > 10000), :] = 1.0
+    mean_gain = float(np.mean(gain[(f >= 250) & (f <= 10000)]))
+    for j in np.flatnonzero(valid):
+        Z[:, j] *= gain[:, phase[j]]
+    _, y = signal.istft(Z, fs, nperseg=nper, noverlap=nper-hop,
+                        boundary=True)
+    out = np.zeros_like(x)
+    out[:min(len(x), len(y))] = y[:len(out)]
+    return out, mean_gain
+
+
+def sync_cancel(x, fs, rpm, ta, tb, K=15, shrink=0.5, depth=1.0,
+                env_suppression=0.7, env_min_gain=0.5,
+                spec_suppression=0.0, spec_min_gain=0.12):
     """Resta el ruido periodico por ciclo de aleteo en el tramo [ta, tb] (s). Devuelve (y, estimacion)."""
     ia, ib = int(ta * fs), int(tb * fs)
     xs = x[ia:ib].astype(np.float64)
     fg = float(np.median(rpm.fout(np.linspace(ta, tb, 200))))
     marks = cycle_marks(xs, fs, fg)
     Tm = int(np.median(np.diff(marks)))
-    h = Tm
-    Lw = 2 * h
     print(f"  tramo {ta:.1f}-{tb:.1f} s: f_aleteo guia {fg:.2f} Hz, {len(marks)} ciclos")
 
     bands = [(100, 500), (100, 1200), (200, 3000), (300, 6000), (300, 6000), (300, 6000)]
     S0, S1 = int(0.004 * fs), int(0.0008 * fs)
-    ar = np.arange(-h, h)
     for q, (lo, hi) in enumerate(bands):                     # de banda estrecha a ancha
         xb = _bp(xs, lo, hi, fs)
         S = S0 if q < 4 else S1
-        marks = marks[(marks - h - S >= 0) & (marks + h + S <= len(xs))]
-        W = xb[marks[:, None] + ar[None, :]].T                # (Lw, nm)
+        marks = marks[(marks - Tm - S >= 0) & (marks + Tm + S <= len(xs))]
+        ar = np.arange(-Tm, Tm + 1)
+        W = xb[marks[:, None] + ar[None, :]].T
         new = marks.copy()
         for k in range(len(marks)):
             cols = list(range(max(0, k - K), k)) + list(range(k + 1, min(len(marks), k + K + 1)))
             Tk = np.median(W[:, cols], axis=1)
-            big = xb[marks[k] - h - S: marks[k] + h + S]
+            big = xb[marks[k] - Tm - S: marks[k] + Tm + S + 1]
             c = signal.correlate(big, Tk, mode="valid", method="fft")
             new[k] = marks[k] + int(np.argmax(c)) - S
         marks = new
-    keep = np.r_[True, np.diff(marks) > 0.5 * Tm]             # marcas ordenadas y separadas
-    marks = marks[keep & (marks - h >= 0) & (marks + h <= len(xs))]
+    # Trata cada intervalo real entre marcas como un ciclo independiente. Se
+    # normaliza temporalmente para que los cambios de RPM no desfasen la plantilla.
+    marks = np.unique(np.clip(marks, 0, len(xs) - 1))
+    marks = marks[(marks >= 0) & (marks < len(xs))]
+    L = max(64, Tm)
+    phase = np.linspace(0, 1, L, endpoint=False)
+    cycles = []
+    for left, right in zip(marks[:-1], marks[1:]):
+        if right - left < 0.5 * Tm or right - left > 1.8 * Tm:
+            cycles.append(None)
+            continue
+        pos = left + phase * (right - left)
+        cycles.append(np.interp(pos, np.arange(len(xs)), xs))
 
-    w = 0.5 - 0.5 * np.cos(2 * np.pi * np.arange(Lw) / Lw)   # Hann periodica (COLA a 50 %)
-    W = xs[marks[:, None] + ar[None, :]].T
-    acc, nrm, gains = np.zeros(len(xs)), np.zeros(len(xs)), []
-    for k in range(len(marks)):
-        cols = list(range(max(0, k - K), k)) + list(range(k + 1, min(len(marks), k + K + 1)))
-        Wn = W[:, cols]
+    # El aleteo parece ruido ancho modulado en amplitud, no una forma de onda
+    # idéntica ciclo a ciclo. Estima la envolvente media sincronizada y baja
+    # los pulsos recurrentes; la máscara es común a todos los ciclos.
+    env_band = _bp(xs, 300, min(8000, 0.45 * fs), fs)
+    env_sos = signal.butter(2, 30, "low", fs=fs, output="sos")
+    env = signal.sosfiltfilt(env_sos, np.abs(env_band))
+    env_cycles = []
+    for k, (left, right) in enumerate(zip(marks[:-1], marks[1:])):
+        if cycles[k] is not None:
+            pos = left + phase * (right - left)
+            env_cycles.append(np.interp(pos, np.arange(len(env)), env))
+    attenuation = np.ones(len(xs), dtype=np.float64)
+    mean_env_gain = 1.0
+    if env_cycles:
+        profile = np.median(np.asarray(env_cycles), axis=0)
+        # Suavizado circular para evitar clics en el borde entre ciclos.
+        profile = ndimage.gaussian_filter1d(profile, max(1, 0.015 * L), mode="wrap")
+        baseline = float(np.median(profile))
+        phase_gain = np.clip((baseline / np.maximum(profile, 1e-12)) ** env_suppression,
+                             env_min_gain, 1.0)
+        mean_env_gain = float(np.mean(phase_gain))
+        for k, (left, right) in enumerate(zip(marks[:-1], marks[1:])):
+            if cycles[k] is not None:
+                n = int(right - left)
+                attenuation[left:right] = np.interp(
+                    np.linspace(0, L, n, endpoint=False), np.arange(L), phase_gain)
+    est = np.zeros(len(xs), dtype=np.float64)
+    gains = []
+    taper_n = max(1, int(0.04 * L))
+    taper = np.ones(L)
+    ramp = 0.5 - 0.5 * np.cos(np.linspace(0, np.pi, taper_n))
+    taper[:taper_n] = ramp
+    taper[-taper_n:] = ramp[::-1]
+    for k, (left, right) in enumerate(zip(marks[:-1], marks[1:])):
+        cur = cycles[k]
+        if cur is None:
+            continue
+        lo, hi = max(0, k-K), min(len(cycles), k+K+1)
+        neigh = [cycles[j] for j in range(lo, hi) if j != k and cycles[j] is not None]
+        if len(neigh) < 3:
+            continue
+        Wn = np.asarray(neigh).T
         Tk = np.median(Wn, axis=1)
-        se = 1.253 * 1.4826 * np.median(np.abs(Wn - Tk[:, None]), axis=1) / np.sqrt(len(cols))
-        Tk = np.sign(Tk) * np.maximum(np.abs(Tk) - shrink * se, 0)       # limpia la plantilla
-        ak = float(np.clip(np.sum(w * W[:, k] * Tk) / (np.sum(w * Tk * Tk) + 1e-12), 0, 1))
+        se = 1.253 * 1.4826 * np.median(np.abs(Wn - Tk[:, None]), axis=1) / np.sqrt(len(neigh))
+        Tk = np.sign(Tk) * np.maximum(np.abs(Tk) - shrink * se, 0)
+        w = taper
+        ak = float(np.clip(np.sum(w * cur * Tk) / (np.sum(w * Tk * Tk) + 1e-12), 0, 1))
         gains.append(ak)
-        sl = slice(marks[k] - h, marks[k] + h)
-        acc[sl] += w * ak * Tk
-        nrm[sl] += w
-    est = np.where(nrm > 1e-3, acc / np.maximum(nrm, 1e-3), 0.0)
+        n = int(right - left)
+        if n <= 0:
+            continue
+        vals = np.interp(np.linspace(0, L, n, endpoint=False), np.arange(L), ak * Tk)
+        est[left:right] = vals
     print(f"  ganancia media por ciclo: {np.mean(gains):.2f}  (0 = sin parecido con la plantilla, 1 = identico)")
+    print(f"  ganancia media de envolvente: {mean_env_gain:.2f}  (menor = mas atenuacion de pulsos)")
+    segment = (xs - depth * est) * attenuation
+    spec_mean_gain = 1.0
+    if spec_suppression > 0:
+        segment, spec_mean_gain = phase_spectral_suppress(
+            segment, fs, marks, strength=spec_suppression, min_gain=spec_min_gain)
+    print(f"  ganancia media espectral sincronizada: {spec_mean_gain:.2f}")
     y = x.copy()
-    y[ia:ib] = xs - depth * est
+    y[ia:ib] = segment
     e = np.zeros_like(x)
     e[ia:ib] = est
     return y, e
@@ -234,10 +345,22 @@ def main():
     ap.add_argument("--rpm-min", type=float, default=300, help="rpm: por debajo no se procesa nada")
     ap.add_argument("--rpm-smooth", type=float, default=2.0, help="s: media movil de la RPM")
     ap.add_argument("--depth", type=float, default=1.0, help="0..1 fraccion de plantilla que se resta")
+    ap.add_argument("--shrink", type=float, default=0.5, help="umbral de limpieza de plantilla (menor = cancela mas)")
+    ap.add_argument("--env-suppression", type=float, default=15.0,
+                    help="fuerza de atenuacion de pulsos sincronizados (0 desactiva)")
+    ap.add_argument("--env-min-gain", type=float, default=0.05,
+                    help="ganancia minima de la atenuacion sincronizada (0..1)")
+    ap.add_argument("--spec-suppression", type=float, default=4.0,
+                    help="fuerza de atenuacion espectral por fase (0 desactiva)")
+    ap.add_argument("--spec-min-gain", type=float, default=0.05,
+                    help="ganancia minima por bin frecuencial en la atenuacion espectral")
+    ap.add_argument("--also-mute-motor", action="store_true",
+                    help="crea una pista aparte con silencio durante los intervalos de motor")
     ap.add_argument("--k", type=int, default=15, help="ciclos vecinos por lado para la mediana")
     ap.add_argument("--notches", action="store_true", help="ademas, muescas en tonos de engranaje")
     a = ap.parse_args()
-    os.makedirs(a.out, exist_ok=True)
+    out_dir = os.path.abspath(os.path.expanduser(a.out))
+    os.makedirs(out_dir, exist_ok=True)
 
     fs, x = read_wav(a.ambiente)
     x = x[:, 0] if x.ndim > 1 else x
@@ -259,7 +382,9 @@ def main():
 
     y, est = x.copy(), np.zeros_like(x)
     for ta, tb in segs:
-        y, e = sync_cancel(y, fs, rpm, ta, tb, K=a.k, depth=a.depth)
+        y, e = sync_cancel(y, fs, rpm, ta, tb, K=a.k, shrink=a.shrink, depth=a.depth,
+                           env_suppression=a.env_suppression, env_min_gain=a.env_min_gain,
+                           spec_suppression=a.spec_suppression, spec_min_gain=a.spec_min_gain)
         est += e
         if a.notches:
             y = tone_notches(y, fs, rpm, ta, tb)
@@ -268,6 +393,7 @@ def main():
     gate = np.interp(np.arange(len(x)) / fs, rpm.tg, rpm.on.astype(float))
     gate = ndimage.uniform_filter1d(gate, int(0.1 * fs))
     y = (gate * y + (1 - gate) * x).astype(np.float32)
+    est = x.astype(np.float32) - y  # diferencia realmente aplicada, incluida la atenuacion de envolvente
 
     # metricas en el tramo con motor
     A, B = int(segs[0][0] * fs), int(segs[0][1] * fs)
@@ -279,26 +405,67 @@ def main():
 
     # salidas: nivel original conservado + version normalizada para escuchar
     peak = np.abs(y).max()
-    write_wav(f"{a.out}/ambiente_limpio.wav", fs, y if peak < 0.99 else y * 0.99 / peak)
+    write_wav(os.path.join(out_dir, "ambiente_limpio.wav"), fs, y if peak < 0.99 else y * 0.99 / peak)
     p999 = np.percentile(np.abs(y), 99.9)
-    write_wav(f"{a.out}/ambiente_limpio_fuerte.wav", fs, y / (p999 + 1e-9) * 0.8)
-    write_wav(f"{a.out}/ruido_aleteo_estimado.wav", fs, est / (np.abs(est).max() + 1e-9) * 0.9)
+    write_wav(os.path.join(out_dir, "ambiente_limpio_fuerte.wav"), fs, y / (p999 + 1e-9) * 0.8)
+    write_wav(os.path.join(out_dir, "ruido_aleteo_estimado.wav"), fs, est / (np.abs(est).max() + 1e-9) * 0.9)
+    if a.also_mute_motor:
+        muted = x.astype(np.float64).copy()
+        fade_n = max(1, int(0.05 * fs))
+        for s, e in rpm.segments():
+            lo, hi = max(0, int(s * fs)), min(len(muted), int(e * fs))
+            muted[lo:hi] = 0.0
+            f0, f1 = max(0, lo-fade_n), min(len(muted), hi+fade_n)
+            if lo > f0:
+                muted[f0:lo] *= np.cos(np.linspace(0, np.pi/2, lo-f0)) ** 2
+            if f1 > hi:
+                muted[hi:f1] *= np.sin(np.linspace(0, np.pi/2, f1-hi)) ** 2
+        mute_path = os.path.join(out_dir, "ambiente_sin_aleteo_silencio_motor.wav")
+        write_wav(mute_path, fs, muted)
+        print(f"Pista sin aleteo (motor silenciado): {mute_path}")
 
-    # figura comparativa (10 s con aleteo)
+    # Figuras de diagnóstico: permiten ver original, lo sustraído y lo conservado.
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
-    t0 = segs[0][0] + 20
-    a0, b0 = int(t0 * fs), int((t0 + 10) * fs)
-    fig, ax = plt.subplots(2, 1, figsize=(13, 8), sharex=True)
-    for axi, sig_, ttl in zip(ax, (x[a0:b0], y[a0:b0]), ("Original", "Limpio")):
-        f, tt, S = signal.spectrogram(sig_, fs, nperseg=2048, noverlap=1536)
-        m = f < 12000
-        axi.pcolormesh(tt + t0, f[m], 10 * np.log10(S[m] + 1e-14), shading="auto", vmin=-120, vmax=-50)
-        axi.set_title(ttl); axi.set_ylabel("Hz")
-    ax[1].set_xlabel("t (s)")
-    plt.tight_layout(); plt.savefig(f"{a.out}/comparacion_espectrograma.png", dpi=80)
-    print(f"\nListo. Archivos en {a.out}")
+    removed = x.astype(np.float32) - y
+    # Vista de 10 s dentro del primer tramo activo (o el tramo disponible).
+    t0 = min(segs[0][0] + 20, max(segs[0][0], segs[0][1] - 10))
+    t1 = min(t0 + 10, dur)
+    a0, b0 = int(t0 * fs), int(t1 * fs)
+    fig, ax = plt.subplots(4, 1, figsize=(14, 13), sharex=True,
+                           gridspec_kw={"height_ratios": [1, 1, 1, 1]})
+    for axi, sig_, ttl in zip(ax[:3], (x, removed, y),
+                              ("Original", "Eliminado (original − limpio)", "Conservado (limpio)")):
+        f, tt, S = signal.spectrogram(sig_[a0:b0], fs, nperseg=2048, noverlap=1536,
+                                      scaling="density")
+        m = f < min(12000, fs / 2)
+        axi.pcolormesh(tt + t0, f[m], 10 * np.log10(S[m] + 1e-14), shading="auto",
+                       vmin=-120, vmax=-50, cmap="magma")
+        axi.set_title(ttl); axi.set_ylabel("Hz"); axi.set_ylim(0, min(12000, fs / 2))
+    tx = np.arange(a0, b0) / fs
+    ax[3].plot(tx, x[a0:b0], lw=.55, alpha=.55, label="Original")
+    ax[3].plot(tx, y[a0:b0], lw=.55, label="Limpio")
+    ax[3].plot(tx, removed[a0:b0], lw=.45, alpha=.8, label="Eliminado", color="tab:red")
+    ax[3].set_ylabel("Amplitud"); ax[3].set_xlabel("Tiempo (s)"); ax[3].legend(loc="upper right", ncol=3)
+    fig.suptitle("Cancelación síncrona: comparación temporal y espectral", y=1.01)
+    plt.tight_layout()
+    fig1_path = save_figure(fig, os.path.join(out_dir, "diagnostico_cancelacion.png"))
+    plt.close(fig)
+
+    # Curvas de potencia media antes/después y espectro de lo sustraído.
+    A, B = int(segs[0][0] * fs), int(segs[0][1] * fs)
+    fig, ax = plt.subplots(figsize=(12, 5))
+    for sig_, label in ((x, "Original"), (y, "Limpio"), (removed, "Eliminado")):
+        f, P = signal.welch(sig_[A:B], fs, nperseg=min(8192, B-A))
+        ax.plot(f, 10*np.log10(P + 1e-20), label=label, lw=1)
+    ax.set_xlim(0, min(10000, fs/2)); ax.set_xlabel("Frecuencia (Hz)")
+    ax.set_ylabel("Potencia (dB/Hz)"); ax.set_title("Espectro medio durante el tramo con motor")
+    ax.grid(True, alpha=.25); ax.legend(); fig.tight_layout()
+    fig2_path = save_figure(fig, os.path.join(out_dir, "espectro_original_eliminado_conservado.png"))
+    plt.close(fig)
+    print(f"Figuras: {fig1_path} y {fig2_path}")
+    print(f"\nListo. Archivos en {out_dir}")
 
 
 if __name__ == "__main__":
